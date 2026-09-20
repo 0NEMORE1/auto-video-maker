@@ -1,5 +1,4 @@
 streamlit
 requests
 edge-tts
-moviepy==1.0.3
-Pillow==9.5.0
+moviepy>=2.0.0
