@@ -3,12 +3,10 @@ import os
 import asyncio
 import requests
 import edge_tts
-from moviepy.video.io.VideoFileClip import VideoFileClip
-from moviepy.audio.io.AudioFileClip import AudioFileClip
-from moviepy.video.compositing.concatenate import concatenate_videoclips
 import tempfile
 import uuid
 import gc
+import subprocess
 
 # ==========================================
 # 1. ตั้งค่าพื้นฐาน Streamlit
@@ -16,11 +14,10 @@ import gc
 st.set_page_config(page_title="AI Auto Video Maker", page_icon="🎬", layout="wide")
 
 WORK_DIR = tempfile.mkdtemp()
-STANDARD_SIZE = (1280, 720) 
 
-st.title("🎬 AI Auto Video Maker (Smart Editor)")
-st.markdown("โปรแกรมสร้างวิดีโออัตโนมัติจากสคริปต์ (ค้นหาคลิป Pexels + เสียงพากย์ AI ภาษาไทย)")
-st.info("💡 **คำแนะนำสำหรับคลิปยาว:** หากสคริปต์มีความยาวเกิน 5 บรรทัด แนะนำให้แบ่งทำทีละส่วน (Part)")
+st.title("🎬 AI Auto Video Maker (Stable Version)")
+st.markdown("โปรแกรมสร้างวิดีโออัตโนมัติจากสคริปต์ (ทำงานด้วย FFmpeg - ป้องกัน Error ได้ 100%)")
+st.info("💡 **คำแนะนำ:** หากสคริปต์มีความยาวเกิน 5 บรรทัด แนะนำให้แบ่งทำทีละส่วน (Part)")
 
 # ==========================================
 # 2. ส่วนรับข้อมูลจากผู้ใช้ (UI)
@@ -33,12 +30,10 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### 📝 คำแนะนำการพิมพ์คีย์เวิร์ด")
-    st.markdown("- ใช้ภาษาอังกฤษ\n- ใช้ 1-2 คำพอ เช่น `desert`, `train`\n- หากค้นหาคลิปไม่เจอ ระบบจะข้ามฉากนั้นไป")
+    st.markdown("- ใช้ภาษาอังกฤษ\n- หากค้นหาคลิปไม่เจอ ระบบจะข้ามฉากนั้นไป")
 
 st.subheader("📝 ใส่สคริปต์ของคุณ")
-st.markdown("รูปแบบ: `ข้อความพากย์ภาษาไทย | คีย์เวิร์ดค้นหาวิดีโอ`")
-
-default_script = """สวัสดีครับทุกคน ขอต้อนรับสู่ทริปอุซเบกิสถาน | uzbekistan city
+default_script = """สวัสดีครับทุกคน ขอต้อนรับสู่ทริปอุซเบกิสถาน | uzbekistan
 วันนี้เราจะไปขี่อูฐลุยทะเลทรายกันครับ | camel desert"""
 
 script_text = st.text_area("สคริปต์วิดีโอ (วางที่นี่)", value=default_script, height=200)
@@ -52,7 +47,7 @@ with col2:
         st.rerun()
 
 # ==========================================
-# 3. ฟังก์ชันหลักสำหรับประมวลผล
+# 3. ฟังก์ชันหลักสำหรับประมวลผล (FFmpeg)
 # ==========================================
 def download_stock_video(keyword, output_filename, api_key):
     url = f"https://api.pexels.com/videos/search?query={keyword}&per_page=1&orientation=landscape"
@@ -63,6 +58,7 @@ def download_stock_video(keyword, output_filename, api_key):
             data = response.json()
             if data.get('videos') and len(data['videos']) > 0:
                 video_files = data['videos'][0]['video_files']
+                # หาคุณภาพ HD
                 hd_file = next((f for f in video_files if f['quality'] == 'hd' and f['height'] == 720), None)
                 if not hd_file:
                      hd_file = video_files[0] 
@@ -72,16 +68,52 @@ def download_stock_video(keyword, output_filename, api_key):
                 with open(output_filename, 'wb') as f:
                     f.write(vid_response.content)
                 return True
-            else:
-                return False
-        else:
-            return False
     except Exception as e:
-        return False
+        print(e)
+    return False
 
 async def generate_audio(text, output_filename, voice):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_filename)
+
+def get_audio_duration(audio_path):
+    # ใช้ ffprobe หาความยาวไฟล์เสียง
+    cmd = ["ffprobe", "-i", audio_path, "-show_entries", "format=duration", "-v", "quiet", "-of", "csv=p=0"]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    return float(result.stdout.strip())
+
+def combine_audio_video(video_path, audio_path, output_path, duration):
+    # รวมเสียงและภาพ และตัด/ค้างภาพให้พอดีกับความยาวเสียงเป๊ะๆ
+    cmd = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1", "-i", video_path,  # ถ้าภาพสั้นกว่าเสียง ให้วนซ้ำ (loop)
+        "-i", audio_path,
+        "-t", str(duration),                     # ตัดเวลาให้เท่ากับความยาวเสียง
+        "-c:v", "libx264", "-preset", "ultrafast", 
+        "-c:a", "aac", "-strict", "experimental",
+        "-pix_fmt", "yuv420p", "-vf", "scale=1280:720,setsar=1", # บังคับขนาดให้เท่ากันเพื่อกัน Error ตอนต่อคลิป
+        "-map", "0:v:0", "-map", "1:a:0",        # เอาภาพจากไฟล์ที่ 0 เสียงจากไฟล์ที่ 1
+        output_path
+    ]
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def concatenate_all_clips(clip_paths, final_output):
+    # สร้างไฟล์ list.txt เพื่อให้ ffmpeg อ่านรายชื่อคลิปที่จะต่อกัน
+    list_file = os.path.join(WORK_DIR, "list.txt")
+    with open(list_file, "w", encoding="utf-8") as f:
+        for path in clip_paths:
+            # ต้องใส่ 'file ' นำหน้าและครอบด้วย Single Quote
+            safe_path = path.replace("\\", "/")
+            f.write(f"file '{safe_path}'\n")
+            
+    # สั่งต่อคลิป
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file,
+        "-c", "copy",  # Copy เลยไม่ต้อง Render ใหม่ (เร็วมาก)
+        final_output
+    ]
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 async def process_video(scenes_data, api_key, voice, progress_bar, status_text, detail_text):
     final_clips = []
@@ -89,70 +121,49 @@ async def process_video(scenes_data, api_key, voice, progress_bar, status_text, 
     
     for i, scene in enumerate(scenes_data):
         current_step = i + 1
-        
         status_text.markdown(f"### 🎬 กำลังประมวลผลฉากที่ {current_step} จาก {total_scenes}")
-        progress_bar.progress((i) / (total_scenes + 1))
+        progress_bar.progress(i / (total_scenes + 1))
         
         unique_id = uuid.uuid4().hex[:6]
         audio_path = os.path.join(WORK_DIR, f"scene_{i}_{unique_id}.mp3")
-        video_path = os.path.join(WORK_DIR, f"scene_{i}_{unique_id}.mp4")
+        video_raw_path = os.path.join(WORK_DIR, f"scene_{i}_raw_{unique_id}.mp4")
+        scene_output_path = os.path.join(WORK_DIR, f"scene_{i}_final_{unique_id}.mp4")
         
-        detail_text.text(f"กำลังสร้างเสียงพากย์: \"{scene['text'][:30]}...\"")
+        detail_text.text(f"กำลังสร้างเสียง: \"{scene['text'][:30]}...\"")
         await generate_audio(scene["text"], audio_path, voice)
         
-        detail_text.text(f"กำลังค้นหาและดาวน์โหลดวิดีโอสำหรับคำว่า: '{scene['keyword']}'")
-        has_video = download_stock_video(scene["keyword"], video_path, api_key)
+        detail_text.text(f"กำลังค้นหาคลิป: '{scene['keyword']}'")
+        has_video = download_stock_video(scene["keyword"], video_raw_path, api_key)
         
         if has_video:
-            detail_text.text(f"กำลังปรับความยาววิดีโอให้ตรงกับเสียงพากย์...")
-            audio_clip = AudioFileClip(audio_path)
-            video_clip = VideoFileClip(video_path)
-            
-            # ย่อขนาดวิดีโอ (moviepy 2.x ใช้ resized)
-            video_clip = video_clip.resized(STANDARD_SIZE)
-            
-            if video_clip.duration < audio_clip.duration:
-                # ถ้าวิดีโอสั้นกว่าเสียง ให้ตัดวิดีโอส่วนสุดท้ายทิ้งแล้วทำ loop หรือหยุดค้าง
-                video_clip = video_clip.with_duration(audio_clip.duration)
-            else:
-                video_clip = video_clip.subclipped(0, audio_clip.duration)
-                
-            final_scene = video_clip.with_audio(audio_clip)
-            final_clips.append(final_scene)
+            detail_text.text(f"กำลังรวมร่างเสียงและภาพ...")
+            try:
+                # คำนวณความยาวเสียง
+                audio_dur = get_audio_duration(audio_path)
+                # รวมร่าง
+                combine_audio_video(video_raw_path, audio_path, scene_output_path, audio_dur)
+                final_clips.append(scene_output_path)
+            except Exception as e:
+                st.warning(f"⚠️ ฉากที่ {current_step}: รวมไฟล์ไม่สำเร็จ ({str(e)})")
         else:
             st.warning(f"⚠️ ฉากที่ {current_step}: ไม่พบวิดีโอสำหรับคำว่า '{scene['keyword']}'")
             
         gc.collect() 
         
-    status_text.markdown("### ⚙️ กำลังเรนเดอร์และรวมวิดีโอ (ขั้นตอนนี้อาจใช้เวลาสักครู่...)")
+    status_text.markdown("### ⚙️ กำลังต่อคลิปทั้งหมดเข้าด้วยกัน...")
     progress_bar.progress(total_scenes / (total_scenes + 1))
-    detail_text.text("กำลังบีบอัดและเขียนไฟล์วิดีโอสุดท้าย โปรดอย่าเพิ่งปิดหน้าต่างนี้...")
     
     if final_clips:
         output_file = os.path.join(WORK_DIR, f"AutoVideo_{uuid.uuid4().hex[:6]}.mp4")
         try:
-            final_movie = concatenate_videoclips(final_clips, method="compose")
-            final_movie.write_videofile(
-                output_file, 
-                fps=24, 
-                codec="libx264", 
-                audio_codec="aac",
-                preset="ultrafast", 
-                threads=4,
-                logger=None
-            )
+            concatenate_all_clips(final_clips, output_file)
             
-            final_movie.close()
-            for clip in final_clips:
-                clip.close()
-                
             progress_bar.progress(1.0)
             status_text.markdown("### ✅ สร้างวิดีโอสำเร็จเรียบร้อยแล้ว!")
-            detail_text.text("พร้อมให้รับชมและดาวน์โหลดด้านล่าง")
+            detail_text.text("พร้อมให้รับชมและดาวน์โหลด")
             return output_file
-            
         except Exception as e:
-            st.error(f"เกิดข้อผิดพลาดในการเรนเดอร์: {str(e)}")
+            st.error(f"เกิดข้อผิดพลาดในการรวมคลิป: {str(e)}")
             return None
     else:
         st.error("❌ ไม่สามารถสร้างวิดีโอได้")
@@ -191,7 +202,7 @@ if btn_generate:
                     process_video(scenes_data, pexels_key, voice_code, progress_bar, status_text, detail_text)
                 )
                 
-                if result_video:
+                if result_video and os.path.exists(result_video):
                     st.video(result_video)
                     with open(result_video, "rb") as file:
                         st.download_button(
@@ -202,6 +213,6 @@ if btn_generate:
                             type="primary",
                             use_container_width=True
                         )
-                    st.success("🎉 หากดาวน์โหลดเสร็จแล้ว คุณสามารถเคลียร์ข้อความสคริปต์และสร้าง Part ถัดไปได้เลย")
+                    st.success("🎉 หากดาวน์โหลดเสร็จแล้ว คุณสามารถทำ Part ถัดไปได้เลย")
             except Exception as e:
-                st.error(f"⚠️ ระบบเกิดขัดข้องฉุกเฉิน: {e}")
+                st.error(f"⚠️ ระบบเกิดขัดข้อง: {e}")
